@@ -1,7 +1,7 @@
 from functools import partial
 from typing import List
-import time
-import datetime
+import blobconverter
+from pathlib import Path
 
 import depthai as dai
 import numpy as np
@@ -18,120 +18,115 @@ from robothub_sdk import (
 if IS_INTERACTIVE:
     import cv2
 
-DETECTION_INTERVAL = datetime.timedelta(seconds=5).seconds
+PREVIEW_SIZE = (640, 640)
 
 class AgeGender(App):
     next_window_position = (0, 0)
     next_detection = 0
-    camera_controls: List[InputStream]
+    camera_controls: List[InputStream] = []
 
     def on_initialize(self, unused_devices: List[dai.DeviceInfo]):
-        self.next_window_position = (0, 30)
-        self.camera_controls = []
-        self.config.add_defaults(send_still_picture=False, send_still_picture_interval=DETECTION_INTERVAL)
-        self.next_detection = 0
+        self.config.add_defaults(
+            send_still_picture=False,
+            detect_threshold=0.5
+        )
+        self.fps = 20
+        self.res = CameraResolution.THE_1080_P
+        self.obj_detections = []
 
     def on_configuration(self, old_configuration: Config):
-        print("Configuration update", self.config.values())
-        if not self.config.send_still_picture:
-            self.next_detection = 0
+        pass
 
-        if self.config.send_still_picture and self.config.send_still_picture_interval != old_configuration.send_still_picture_interval:
-            self.next_detection = time.monotonic() + self.config.send_still_picture_interval
+    def on_detection(self,
+            device_id: str,
+            obj_data: dai.NNData,
+            obj_frame: dai.ImgFrame,
+            frame: dai.ImgFrame):
+
+        self.obj_detections = []
+        cv_frame = obj_frame.getCvFrame()
+        out = np.array(obj_data.getLayerFp16('detection_out'))
+        out = out.reshape(len(out) // 7, 7)
+        out = out[out[..., 2] > 0.5]
+        for detection in out:
+            xmin, ymin, xmax, ymax = (detection[3:7] * PREVIEW_SIZE[0]).astype('int')
+            # print(f'[{xmin}, {ymin}], [{xmax}, {ymax}]')
+            bbox = (xmin, ymin, xmax, ymax)
+            self.obj_detections.append((detection, bbox))
 
     def on_setup(self, device):
-        fps = 25
-        res = CameraResolution.THE_1080_P
-
-        for camera in device.cameras:
-            stream_id = f"{device.id}-{camera.name}"
-
-            if camera == dai.CameraBoardSocket.RGB:
-                device.configure_camera(
-                    camera,
-                    res=res,
-                    fps=fps,
-                    preview_size=(1080, 1080)
-                )
-                self.camera_controls.append(device.streams.color_control)
-
-                if IS_INTERACTIVE:
-                    device.streams.color_still.consume()
-                    device.streams.color_still.description = f"{device.name} {device.streams.color_still.description}"
-                    device.streams.color_preview.consume()
-                    stream_id = device.streams.color_preview.description = f"{device.name} {device.streams.color_preview.description}"
-                else:
-                    encoder = device.create_encoder(
-                        device.streams.color_still.output_node,
-                        fps=8,
-                        profile=dai.VideoEncoderProperties.Profile.MJPEG,
-                        quality=80,
-                    )
-                    device.streams.create(
-                        encoder,
-                        encoder.bitstream,
-                        stream_type=StreamType.BINARY,
-                        rate=8,
-                    ).consume(partial(self.on_still_frame, device.id))
-                    device.streams.color_video.publish()
-
-            if IS_INTERACTIVE:
-                cv2.namedWindow(stream_id)
-                cv2.moveWindow(stream_id, *self.next_window_position)
-                self.next_window_position = (
-                    self.next_window_position[0] + 650,
-                    self.next_window_position[1],
-                )
-
-        self.next_window_position = (0, self.next_window_position[1] + 500)
-
-    def on_still_frame(self, device_id: str, frame: dai.ImgFrame):
-        print("Sending detection...")
-        self.send_detection(
-            f"Still frame from device {device_id}",
-            tags=["periodic", "still"],
-            frames=[(frame, "jpeg")],
+        camera = device.configure_camera(
+            dai.CameraBoardSocket.RGB,
+            res=self.res,
+            fps=self.fps,
+            preview_size=PREVIEW_SIZE
         )
+        camera.initialControl.setSceneMode(
+                dai.CameraControl.SceneMode.FACE_PRIORITY)
+        face_blob_path = Path(blobconverter.from_zoo(
+            name="face-detection-retail-0004",
+            shaves=6
+        ))
+        age_gender_blob_path = Path(blobconverter.from_zoo(
+            name="age-gender-recognition-retail-0013",
+            shaves=6
+        ))
+
+        _, nn_face_det_out, nn_face_det_passthrough = device.create_nn(
+            device.streams.color_preview,
+            face_blob_path,
+            input_size=(300, 300)
+        )
+        _, nn_ag_det_out, nn_ag_det_passthrough = device.create_nn(
+            nn_face_det_passthrough,
+            age_gender_blob_path,
+            input_size=(62, 62)
+        )
+        if IS_INTERACTIVE:
+            device.streams.color_video.consume()
+            device.streams.color_video.description = (
+                f"{device.name} {device.streams.color_video.description}"
+            )
+            device.streams.synchronize(
+                (nn_face_det_out, nn_face_det_passthrough, device.streams.color_video),
+                partial(self.on_detection, device.id)
+            )
+        self.camera_controls.append(device.streams.color_control)
+
+        if IS_INTERACTIVE:
+            device.streams.color_preview.consume()
+            stream_id = device.streams.color_preview.description = f"{device.name} {device.streams.color_preview.description}"
 
     def on_update(self):
         if IS_INTERACTIVE:
             for device in self.devices:
                 for camera in device.cameras:
-                    if camera == dai.CameraBoardSocket.RGB:
-                        cv2.imshow(
-                            device.streams.color_still.description,
-                            device.streams.color_still.last_value.getCvFrame() if device.streams.color_still.last_value is not None else np.empty([1, 1]),
-                        )
-                        cv2.imshow(
-                            device.streams.color_preview.description,
-                            device.streams.color_preview.last_value.getCvFrame() if device.streams.color_preview.last_value is not None else np.empty([1, 1]),
-                        )
-                    elif camera == dai.CameraBoardSocket.LEFT:
-                        cv2.imshow(
-                            device.streams.mono_left_video.description,
-                            device.streams.mono_left_video.last_value.getCvFrame() if device.streams.mono_left_video.last_value is not None else np.empty([1, 1]),
-                        )
-                    elif camera == dai.CameraBoardSocket.RIGHT:
-                        cv2.imshow(
-                            device.streams.mono_right_video.description,
-                            device.streams.mono_right_video.last_value.getCvFrame() if device.streams.mono_right_video.last_value is not None else np.empty([1, 1]),
-                        )
+                    if camera != dai.CameraBoardSocket.RGB:
+                        continue
+                    if device.streams.color_preview.last_value:
+                        frame = (device
+                            .streams
+                            .color_preview
+                            .last_value
+                            .getCvFrame())
+                    else:
+                        frame = np.empty([1, 1])
+                    for detection, bbox in self.obj_detections:
+                        # print(bbox)
+                        cv2.rectangle(
+                            frame,
+                            (bbox[0], bbox[1]),
+                            (bbox[2], bbox[3]),
+                            (0, 255, 0),
+                            2
+                    )
+                    cv2.imshow(
+                        device.streams.color_preview.description,
+                        frame
+                    )
 
-        if self.config.send_still_picture and self.next_detection < time.monotonic():
-            for camera_control in self.camera_controls:
-                ctl = dai.CameraControl()
-                ctl.setCaptureStill(True)
-                camera_control.send(ctl)
-            self.next_detection = time.monotonic() + self.config.send_still_picture_interval
-
-        if IS_INTERACTIVE:
-            key = cv2.waitKey(1)
-            if key == ord("c"):
-                self.config.send_still_picture = not self.config.send_still_picture
-                self.next_detection = time.monotonic()
-            elif key == ord("q"):
-                self.stop()
+        if IS_INTERACTIVE and cv2.waitKey(1) == ord("q"):
+            self.stop()
 
 
-app = HelloWorld()
-app.run()
+AgeGender().run()
