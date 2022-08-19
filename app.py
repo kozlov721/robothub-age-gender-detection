@@ -52,7 +52,6 @@ class AgeGender(App):
         # genders = np.array(recognition.getLayerFp16('prob'))
         # print(genders.shape)
         for i, det in enumerate(face_detection.detections):
-            print([det.xmin, det.ymin, det.xmax, det.ymax])
             bbox = self.frame_norm(
                 [det.xmin, det.ymin, det.xmax, det.ymax]
             )
@@ -87,6 +86,11 @@ class AgeGender(App):
             confidence=0.5,
         )
 
+        rec_manip, rec_manip_stream = device.create_image_manipulator()
+        rec_manip.setMaxOutputFrameSize(62 * 62 * 3)
+        rec_manip.initialConfig.setResize((62, 62))
+        rec_manip.inputConfig.setWaitForMessage(True)
+
         script = device.create_script(
             script_path=Path("./script.py"),
             inputs={
@@ -95,18 +99,10 @@ class AgeGender(App):
                 'preview': copy_manip_stream,
             },
             outputs={
-                'manip_cfg': copy_manip.inputConfig,
-                'manip_img': copy_manip.inputImage,
+                'manip_cfg': rec_manip.inputConfig,
+                'manip_img': rec_manip.inputImage,
             },
         )
-
-        (rec_manip, rec_manip_stream) = device.create_image_manipulator()
-        rec_manip.setMaxOutputFrameSize(62 * 62 * 3)
-        rec_manip.initialConfig.setResize((62, 62))
-        rec_manip.inputConfig.setWaitForMessage(True)
-
-        script.outputs['manip_cfg'].link(rec_manip.inputConfig)
-        script.outputs['manip_img'].link(rec_manip.inputImage)
 
         _, recognition_nn, _ = device.create_nn(
             rec_manip_stream,
@@ -137,9 +133,10 @@ class AgeGender(App):
                 for camera in device.cameras:
                     if camera != dai.CameraBoardSocket.RGB:
                         continue
+                    # device.getOutputQueue('recognition')
                     if device.streams.color_preview.last_value:
                         last_val = cast(dai.ImgFrame, device.streams.color_preview.last_value)
-                        frame = last_val.getCvFrame()
+                        frame = cast(cv2.Mat, last_val.getCvFrame())
                         for bbox, age in self.obj_detections:
                             # print(bbox)
                             cv2.rectangle(

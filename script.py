@@ -6,30 +6,21 @@ def add_msg(msg, name, seq = None):
     if seq is None:
         seq = msg.getSequenceNum()
     seq = str(seq)
-    # node.warn(f"New msg {name}, seq {seq}")
 
-    # Each seq number has it's own dict of msgs
     if seq not in msgs:
         msgs[seq] = dict()
     msgs[seq][name] = msg
 
-    # To avoid freezing (not necessary for this ObjDet model)
-    if 15 < len(msgs):
-        node.warn(f"Removing first element! len {len(msgs)}")
-        msgs.popitem() # Remove first element
 
 def get_msgs():
     global msgs
-    seq_remove = [] # Arr of sequence numbers to get deleted
+    seq_remove = []
     for seq, syncMsgs in msgs.items():
-        seq_remove.append(seq) # Will get removed from dict if we find synced msgs pair
-        # node.warn(f"Checking sync {seq}")
-
-        # Check if we have both detections and color frame with this sequence number
-        if len(syncMsgs) == 2: # 1 frame, 1 detection
+        seq_remove.append(seq)
+        if len(syncMsgs) == 2:
             for rm in seq_remove:
                 del msgs[rm]
-            return syncMsgs # Returned synced msgs
+            return syncMsgs
     return None
 
 def correct_bb(bb):
@@ -40,16 +31,14 @@ def correct_bb(bb):
     return bb
 
 while True:
-    time.sleep(0.001) # Avoid lazy looping
+    time.sleep(0.001)
 
     preview = node.io['preview'].tryGet()
     if preview is not None:
         add_msg(preview, 'preview')
 
     face_dets = node.io['face_det_in'].tryGet()
-    # node.warn(str(face_dets))
     if face_dets is not None:
-        # TODO: in 2.18.0.0 use face_dets.getSequenceNum()
         passthrough = node.io['passthrough'].get()
         seq = passthrough.getSequenceNum()
         add_msg(face_dets, 'dets', seq)
@@ -57,13 +46,12 @@ while True:
     sync_msgs = get_msgs()
     if sync_msgs is not None:
         img = sync_msgs['preview']
+        # node.warn(str(type(img)))
         dets = sync_msgs['dets']
         for i, det in enumerate(dets.detections):
-            # node.warn(f'{det.xmin}, {det.xmax}')
             cfg = ImageManipConfig()
             correct_bb(det)
             cfg.setCropRect(det.xmin, det.ymin, det.xmax, det.ymax)
-            node.warn(f"Sending {i + 1}. det. Seq {seq}. Det {det.xmin}, {det.ymin}, {det.xmax}, {det.ymax} Conf: {det.confidence}")
             cfg.setResize(62, 62)
             cfg.setKeepAspectRatio(False)
             node.io['manip_cfg'].send(cfg)
