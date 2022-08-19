@@ -1,5 +1,5 @@
 from functools import partial
-from typing import List, cast
+from typing import List, cast, Literal
 import blobconverter
 from pathlib import Path
 
@@ -32,33 +32,34 @@ class AgeGender(App):
         self.res = CameraResolution.THE_1080_P
         self.preview_size = (640, 640)
         self.obj_detections = []
+        self.msgs = {}
 
     def on_configuration(self, old_configuration: Config):
         pass
 
-    def frame_norm(self, bbox):
-        return (np.array(bbox) * self.preview_size[0]).astype('int')
+    def make_bbox(self, det: dai.ImgDetection):
+        if det.xmin < 0: det.xmin = 0.001
+        if det.ymin < 0: det.ymin = 0.001
+        if det.xmax > 1: det.xmax = 0.999
+        if det.ymax > 1: det.ymax = 0.999
+        return (np.array([det.xmin, det.ymin, det.xmax, det.ymax]) * self.preview_size[0]).astype('int')
 
-    def on_detection(self,
-            device_id: str,
-            face_detection: dai.ImgDetections,
-            # recognition: dai.NNData,
-            frame: dai.ImgFrame):
+    def add_msg(self, msg: dai.ImgFrame | dai.ImgDetections | dai.NNData):
+        seq = str(msg.getSequenceNum())
+        if seq not in self.msgs:
+            self.msgs[seq] = {}
+        if "recognition" not in self.msgs[seq]:
+            self.msgs[seq]["recognition"] = []
 
-        self.obj_detections = []
-        # print(face_detection.detections)
-        # ages = np.array(recognition.getLayerFp16('age_conv3'))
-        # ages = (ages * 100).astype('int')
-        # genders = np.array(recognition.getLayerFp16('prob'))
-        # print(genders.shape)
-        for i, det in enumerate(face_detection.detections):
-            bbox = self.frame_norm(
-                [det.xmin, det.ymin, det.xmax, det.ymax]
-            )
-            print(bbox)
-            # self.obj_detections.append((bbox, ages[i]))
-            self.obj_detections.append((bbox, 20))
+        if isinstance(msg, dai.NNData): # name == "recognition":
+            self.msgs[seq]["recognition"].append(msg)
 
+        elif isinstance(msg, dai.ImgDetections): # name == "detection":
+            self.msgs[seq]["detection"] = msg
+            self.msgs[seq]["len"] = len(msg.detections)
+
+        elif isinstance(msg, dai.ImgFrame): # name == "color": # color
+            self.msgs[seq]["color"] = msg
 
     def on_setup(self, device: Device):
         camera = device.configure_camera(
@@ -91,7 +92,7 @@ class AgeGender(App):
         rec_manip.initialConfig.setResize((62, 62))
         rec_manip.inputConfig.setWaitForMessage(True)
 
-        script = device.create_script(
+        device.create_script(
             script_path=Path("./script.py"),
             inputs={
                 'face_det_in': face_det_nn,
@@ -117,15 +118,25 @@ class AgeGender(App):
             device.streams.color_video.description = (
                 f"{device.name} {device.streams.color_video.description}"
             )
-            device.streams.synchronize(
-                # (face_det_nn, recognition_nn, device.streams.color_video),
-                (face_det_nn, device.streams.color_video),
-                partial(self.on_detection, device.id) # type: ignore
-            )
+            face_det_nn.consume(self.add_msg) # type: ignore
+            recognition_nn.consume(self.add_msg) # type: ignore
+            device.streams.color_preview.consume(self.add_msg) # type: ignore
 
         if IS_INTERACTIVE:
             device.streams.color_preview.consume()
             device.streams.color_preview.description = f"{device.name} {device.streams.color_preview.description}"
+
+    def get_msgs(self):
+        seq_remove = []
+
+        for seq, msgs in self.msgs.items():
+            seq_remove.append(seq)
+            if "color" in msgs and "len" in msgs:
+                if msgs["len"] == len(msgs["recognition"]):
+                    for rm in seq_remove:
+                        del self.msgs[rm]
+                    return msgs
+        return None
 
     def on_update(self):
         if IS_INTERACTIVE:
@@ -133,24 +144,67 @@ class AgeGender(App):
                 for camera in device.cameras:
                     if camera != dai.CameraBoardSocket.RGB:
                         continue
-                    # device.getOutputQueue('recognition')
-                    if device.streams.color_preview.last_value:
-                        last_val = cast(dai.ImgFrame, device.streams.color_preview.last_value)
-                        frame = cast(cv2.Mat, last_val.getCvFrame())
-                        for bbox, age in self.obj_detections:
-                            # print(bbox)
-                            cv2.rectangle(
-                                frame,
-                                (bbox[0], bbox[1]),
-                                (bbox[2], bbox[3]),
-                                (0, 255, 0),
-                                2
-                            )
-                            # print(age)
-                        cv2.imshow(
-                            device.streams.color_preview.description,
-                            frame
+                    msgs = self.get_msgs()
+                    if not msgs:
+                        continue
+                    frame = cast(cv2.Mat, msgs['color'].getCvFrame())
+                    detections = msgs['detection'].detections
+                    recognitions = msgs['recognition']
+                    for i, det in enumerate(detections):
+                        bbox = self.make_bbox(det)
+                        rec = recognitions[i]
+                        age = int(rec.getLayerFp16('age_conv3')[0] * 100)
+                        gender = rec.getLayerFp16('prob')
+                        gender_str = "female" if gender[0] > gender[1] else "male"
+
+                        cv2.rectangle(
+                            frame,
+                            (bbox[0], bbox[1]),
+                            (bbox[2], bbox[3]),
+                            (10, 245, 10),
+                            2
                         )
+                        y = (bbox[1] + bbox[3]) // 2
+                        cv2.putText(
+                            frame,
+                            str(age),
+                            (bbox[0], y),
+                            cv2.FONT_HERSHEY_TRIPLEX,
+                            1.5,
+                            (0, 0, 0),
+                            8
+                        )
+                        cv2.putText(
+                            frame,
+                            str(age),
+                            (bbox[0], y),
+                            cv2.FONT_HERSHEY_TRIPLEX,
+                            1.5,
+                            (255, 255, 255),
+                            2
+                        )
+                        cv2.putText(
+                            frame,
+                            gender_str,
+                            (bbox[0], y + 30),
+                            cv2.FONT_HERSHEY_TRIPLEX,
+                            1.5,
+                            (0, 0, 0),
+                            8
+                        )
+                        cv2.putText(
+                            frame,
+                            gender_str,
+                            (bbox[0], y + 30),
+                            cv2.FONT_HERSHEY_TRIPLEX,
+                            1.5,
+                            (255, 255, 255),
+                            2
+                        )
+                    cv2.imshow(
+                        device.streams.color_preview.description,
+                        frame
+                    )
 
         if IS_INTERACTIVE and cv2.waitKey(1) == ord("q"):
             self.stop()
