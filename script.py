@@ -1,7 +1,7 @@
 import time
 msgs = dict()
 
-def add_msg(msg, name, seq = None):
+def add_msg(msg, name, seq=None):
     global msgs
     if seq is None:
         seq = msg.getSequenceNum()
@@ -46,7 +46,6 @@ while True:
     sync_msgs = get_msgs()
     if sync_msgs is not None:
         img = sync_msgs['preview']
-        # node.warn(str(type(img)))
         dets = sync_msgs['dets']
         for i, det in enumerate(dets.detections):
             cfg = ImageManipConfig()

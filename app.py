@@ -1,6 +1,5 @@
 from functools import partial
 from typing import List, cast, Literal
-import blobconverter
 from pathlib import Path
 
 import depthai as dai
@@ -11,6 +10,7 @@ from robothub_sdk import (
     IS_INTERACTIVE,
     CameraResolution,
     Config,
+    StreamType,
 )
 
 from robothub_sdk.device import Device
@@ -51,15 +51,26 @@ class AgeGender(App):
         if "recognition" not in self.msgs[seq]:
             self.msgs[seq]["recognition"] = []
 
-        if isinstance(msg, dai.NNData): # name == "recognition":
+        if isinstance(msg, dai.NNData):
             self.msgs[seq]["recognition"].append(msg)
 
-        elif isinstance(msg, dai.ImgDetections): # name == "detection":
+        elif isinstance(msg, dai.ImgDetections):
             self.msgs[seq]["detection"] = msg
             self.msgs[seq]["len"] = len(msg.detections)
 
-        elif isinstance(msg, dai.ImgFrame): # name == "color": # color
+        elif isinstance(msg, dai.ImgFrame):
             self.msgs[seq]["color"] = msg
+
+    def get_msgs(self):
+        seq_remove = []
+        for seq, msgs in self.msgs.items():
+            seq_remove.append(seq)
+            if "color" in msgs and "len" in msgs:
+                if msgs["len"] == len(msgs["recognition"]):
+                    for rm in seq_remove:
+                        del self.msgs[rm]
+                    return msgs
+        return None
 
     def on_setup(self, device: Device):
         camera = device.configure_camera(
@@ -71,20 +82,12 @@ class AgeGender(App):
         camera.initialControl.setSceneMode(
                 dai.CameraControl.SceneMode.FACE_PRIORITY)
 
-        copy_manip, copy_manip_stream = device.create_image_manipulator()
-        copy_manip.setNumFramesPool(15)
-        copy_manip.setMaxOutputFrameSize(
-                self.preview_size[0] * self.preview_size[1] * 3)
-
-        device.streams.color_preview.output_node.link(copy_manip.inputImage)
         _, face_det_nn, face_det_nn_passthrough = device.create_nn(
-            copy_manip_stream,
-            Path(blobconverter.from_zoo(
-                name="face-detection-retail-0004",
-                shaves=6)),
+            device.streams.color_preview,
+            Path('./face-detection.blob'),
             nn_family='mobilenet',
             input_size=(300, 300),
-            confidence=0.5,
+            confidence=0.7,
         )
 
         rec_manip, rec_manip_stream = device.create_image_manipulator()
@@ -97,7 +100,7 @@ class AgeGender(App):
             inputs={
                 'face_det_in': face_det_nn,
                 'passthrough': face_det_nn_passthrough,
-                'preview': copy_manip_stream,
+                'preview': device.streams.color_preview,
             },
             outputs={
                 'manip_cfg': rec_manip.inputConfig,
@@ -107,36 +110,35 @@ class AgeGender(App):
 
         _, recognition_nn, _ = device.create_nn(
             rec_manip_stream,
-            Path(blobconverter.from_zoo(
-                name="age-gender-recognition-retail-0013",
-                shaves=6)),
+            Path('./age-gender-recognition.blob'),
             input_size=(62, 62),
         )
 
+        face_det_nn.consume(self.add_msg) # type: ignore
+        recognition_nn.consume(self.add_msg) # type: ignore
+
         if IS_INTERACTIVE:
-            device.streams.color_video.consume()
             device.streams.color_video.description = (
                 f"{device.name} {device.streams.color_video.description}"
             )
-            face_det_nn.consume(self.add_msg) # type: ignore
-            recognition_nn.consume(self.add_msg) # type: ignore
             device.streams.color_preview.consume(self.add_msg) # type: ignore
 
-        if IS_INTERACTIVE:
-            device.streams.color_preview.consume()
             device.streams.color_preview.description = f"{device.name} {device.streams.color_preview.description}"
-
-    def get_msgs(self):
-        seq_remove = []
-
-        for seq, msgs in self.msgs.items():
-            seq_remove.append(seq)
-            if "color" in msgs and "len" in msgs:
-                if msgs["len"] == len(msgs["recognition"]):
-                    for rm in seq_remove:
-                        del self.msgs[rm]
-                    return msgs
-        return None
+        else:
+            encoder = device.create_encoder(
+                device.streams.color_video.output_node,
+                fps=self.fps,
+                profile=dai.VideoEncoderProperties.Profile.MJPEG,
+                quality=80,
+            )
+            encoder_stream = device.streams.create(
+                encoder,
+                encoder.bitstream,
+                stream_type=StreamType.FRAME,
+                rate=self.fps,
+            )
+            encoder_stream.consume(self.add_msg) # type: ignore
+            device.streams.color_video.publish()
 
     def on_update(self):
         if IS_INTERACTIVE:
@@ -172,7 +174,7 @@ class AgeGender(App):
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
                             (0, 0, 0),
-                            8
+                            8,
                         )
                         cv2.putText(
                             frame,
@@ -181,7 +183,7 @@ class AgeGender(App):
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
                             (255, 255, 255),
-                            2
+                            2,
                         )
                         cv2.putText(
                             frame,
@@ -190,7 +192,7 @@ class AgeGender(App):
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
                             (0, 0, 0),
-                            8
+                            8,
                         )
                         cv2.putText(
                             frame,
@@ -199,11 +201,11 @@ class AgeGender(App):
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
                             (255, 255, 255),
-                            2
+                            2,
                         )
                     cv2.imshow(
                         device.streams.color_preview.description,
-                        frame
+                        frame,
                     )
 
         if IS_INTERACTIVE and cv2.waitKey(1) == ord("q"):

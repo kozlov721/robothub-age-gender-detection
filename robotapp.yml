@@ -1,6 +1,6 @@
-version: '1.1.0'
+version: '0.9.9'
 image: luxonis/basic-app
-name: RobotHub Basic App
-description: Face and gender recognition.
+name: Age and Gender Recognition
+description: Age and gender recognition.
 language: python
 url: https://github.com/kozlov721/robothub-age-gender
