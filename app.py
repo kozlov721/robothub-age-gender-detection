@@ -1,48 +1,28 @@
-from functools import partial
-from typing import List, cast, Literal
+from typing import cast
 from pathlib import Path
+
+from robothub_sdk import App, IS_INTERACTIVE, CameraResolution, StreamType
+from robothub_sdk.device import Device
 
 import depthai as dai
 import numpy as np
-
-from robothub_sdk import (
-    App,
-    IS_INTERACTIVE,
-    CameraResolution,
-    Config,
-    StreamType,
-)
-
-from robothub_sdk.device import Device
 
 if IS_INTERACTIVE:
     import cv2
 
 
 class AgeGender(App):
-    next_window_position = (0, 0)
-    next_detection = 0
-
-    def on_initialize(self, unused_devices: List[dai.DeviceInfo]):
-        self.config.add_defaults(
-            send_still_picture=False,
-            detect_threshold=0.5
-        )
+    def on_initialize(self, _):
+        self.config.add_defaults(detection_threshold=0.7)
         self.fps = 20
         self.res = CameraResolution.THE_1080_P
-        self.preview_size = (640, 640)
-        self.obj_detections = []
+        self.preview_size = (1080, 1080)
         self.msgs = {}
 
-    def on_configuration(self, old_configuration: Config):
-        pass
-
     def make_bbox(self, det: dai.ImgDetection):
-        if det.xmin < 0: det.xmin = 0.001
-        if det.ymin < 0: det.ymin = 0.001
-        if det.xmax > 1: det.xmax = 0.999
-        if det.ymax > 1: det.ymax = 0.999
-        return (np.array([det.xmin, det.ymin, det.xmax, det.ymax]) * self.preview_size[0]).astype('int')
+        bbox = np.array([det.xmin, det.ymin, det.xmax, det.ymax])
+        bbox = np.clip(bbox, 0.0, 1.0)
+        return (bbox * self.preview_size[0]).astype("int")
 
     def add_msg(self, msg: dai.ImgFrame | dai.ImgDetections | dai.NNData):
         seq = str(msg.getSequenceNum())
@@ -60,6 +40,9 @@ class AgeGender(App):
 
         elif isinstance(msg, dai.ImgFrame):
             self.msgs[seq]["color"] = msg
+
+        if len(self.msgs) > 15:
+            self.msgs.popitem()
 
     def get_msgs(self):
         seq_remove = []
@@ -84,46 +67,42 @@ class AgeGender(App):
 
         _, face_det_nn, face_det_nn_passthrough = device.create_nn(
             device.streams.color_preview,
-            Path('./face-detection.blob'),
-            nn_family='mobilenet',
+            Path("./face-detection.blob"),
+            nn_family="mobilenet",
             input_size=(300, 300),
-            confidence=0.7,
+            confidence=cast(float, self.config.detection_threshold),
         )
 
         rec_manip, rec_manip_stream = device.create_image_manipulator()
-        rec_manip.setMaxOutputFrameSize(62 * 62 * 3)
-        rec_manip.initialConfig.setResize((62, 62))
         rec_manip.inputConfig.setWaitForMessage(True)
 
         device.create_script(
             script_path=Path("./script.py"),
             inputs={
-                'face_det_in': face_det_nn,
-                'passthrough': face_det_nn_passthrough,
-                'preview': device.streams.color_preview,
+                "face_det_in": face_det_nn,
+                "passthrough": face_det_nn_passthrough,
+                "preview": device.streams.color_preview,
             },
             outputs={
-                'manip_cfg': rec_manip.inputConfig,
-                'manip_img': rec_manip.inputImage,
+                "manip_cfg": rec_manip.inputConfig,
+                "manip_img": rec_manip.inputImage,
             },
         )
 
         _, recognition_nn, _ = device.create_nn(
             rec_manip_stream,
-            Path('./age-gender-recognition.blob'),
+            Path("./age-gender-recognition.blob"),
             input_size=(62, 62),
         )
 
-        face_det_nn.consume(self.add_msg) # type: ignore
-        recognition_nn.consume(self.add_msg) # type: ignore
+        face_det_nn.consume(self.add_msg)  # type: ignore
+        recognition_nn.consume(self.add_msg)  # type: ignore
 
         if IS_INTERACTIVE:
-            device.streams.color_video.description = (
-                f"{device.name} {device.streams.color_video.description}"
+            device.streams.color_preview.consume(self.add_msg)  # type: ignore
+            device.streams.color_preview.description = (
+                f"{device.name} {device.streams.color_preview.description}"
             )
-            device.streams.color_preview.consume(self.add_msg) # type: ignore
-
-            device.streams.color_preview.description = f"{device.name} {device.streams.color_preview.description}"
         else:
             encoder = device.create_encoder(
                 device.streams.color_video.output_node,
@@ -137,7 +116,7 @@ class AgeGender(App):
                 stream_type=StreamType.FRAME,
                 rate=self.fps,
             )
-            encoder_stream.consume(self.add_msg) # type: ignore
+            encoder_stream.consume(self.add_msg)  # type: ignore
             device.streams.color_video.publish()
 
     def on_update(self):
@@ -149,15 +128,16 @@ class AgeGender(App):
                     msgs = self.get_msgs()
                     if not msgs:
                         continue
-                    frame = cast(cv2.Mat, msgs['color'].getCvFrame())
-                    detections = msgs['detection'].detections
-                    recognitions = msgs['recognition']
-                    for i, det in enumerate(detections):
+                    frame = cast(cv2.Mat, msgs["color"].getCvFrame())
+                    detections = msgs["detection"].detections
+                    recognitions = msgs["recognition"]
+
+                    for det, rec in zip(detections, recognitions):
                         bbox = self.make_bbox(det)
-                        rec = recognitions[i]
-                        age = int(rec.getLayerFp16('age_conv3')[0] * 100)
-                        gender = rec.getLayerFp16('prob')
-                        gender_str = "female" if gender[0] > gender[1] else "male"
+                        age = int(rec.getLayerFp16("age_conv3")[0] * 100)
+                        gender = rec.getLayerFp16("prob")
+                        gender_str = ("female" if gender[0] > gender[1]
+                                      else "male")
 
                         cv2.rectangle(
                             frame,

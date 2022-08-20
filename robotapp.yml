@@ -1,6 +1,14 @@
-version: '0.9.9'
+version: '0.9.11'
 image: luxonis/basic-app
 name: Age and Gender Recognition
 description: Age and gender recognition.
 language: python
 url: https://github.com/kozlov721/robothub-age-gender
+configuration:
+  detection_threshold:
+    label: 'Threshold confidence for face detection'
+    type: 'num-range'
+    step: 0.1
+    min: 0.3
+    max: 1.0
+    default: 0.7
