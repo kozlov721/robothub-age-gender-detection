@@ -1,4 +1,5 @@
 from typing import cast
+from functools import partial
 from pathlib import Path
 
 from robothub_sdk import App, IS_INTERACTIVE, CameraResolution, StreamType
@@ -6,6 +7,7 @@ from robothub_sdk.device import Device
 
 import depthai as dai
 import numpy as np
+import time
 
 if IS_INTERACTIVE:
     import cv2
@@ -13,11 +15,15 @@ if IS_INTERACTIVE:
 
 class AgeGender(App):
     def on_initialize(self, _):
-        self.config.add_defaults(detection_threshold=0.7)
+        self.config.add_defaults(
+            detection_threshold=0.7,
+            time_delta=10,
+        )
         self.fps = 20
         self.res = CameraResolution.THE_1080_P
         self.preview_size = (1080, 1080)
         self.msgs = {}
+        self.last_detection = int(time.monotonic())
 
     def make_bbox(self, det: dai.ImgDetection):
         bbox = np.array([det.xmin, det.ymin, det.xmax, det.ymax])
@@ -65,6 +71,9 @@ class AgeGender(App):
         camera.initialControl.setSceneMode(
                 dai.CameraControl.SceneMode.FACE_PRIORITY)
 
+        self.scale_x = camera.getVideoWidth() // self.preview_size[0]
+        self.scale_y = camera.getVideoHeight() // self.preview_size[1]
+
         _, face_det_nn, face_det_nn_passthrough = device.create_nn(
             device.streams.color_preview,
             Path("./face-detection.blob"),
@@ -89,23 +98,27 @@ class AgeGender(App):
             },
         )
 
-        _, recognition_nn, _ = device.create_nn(
+        _, rec_nn, _ = device.create_nn(
             rec_manip_stream,
             Path("./age-gender-recognition.blob"),
             input_size=(62, 62),
         )
 
         face_det_nn.consume(self.add_msg)  # type: ignore
-        recognition_nn.consume(self.add_msg)  # type: ignore
+        rec_nn.consume(self.add_msg)  # type: ignore
+        device.streams.color_preview.consume(self.add_msg)  # type: ignore
 
         if IS_INTERACTIVE:
-            device.streams.color_preview.consume(self.add_msg)  # type: ignore
             device.streams.color_preview.description = (
                 f"{device.name} {device.streams.color_preview.description}"
             )
         else:
+            res_manip, res_manip_stream = device.create_image_manipulator()
+            res_manip.initialConfig.setResize(1056, self.preview_size[1])
+            res_manip.setMaxOutputFrameSize(1056 * self.preview_size[1] * 3)
+            device.streams.color_video.output_node.link(res_manip.inputImage)
             encoder = device.create_encoder(
-                device.streams.color_video.output_node,
+                res_manip_stream.output_node,
                 fps=self.fps,
                 profile=dai.VideoEncoderProperties.Profile.MJPEG,
                 quality=80,
@@ -116,8 +129,44 @@ class AgeGender(App):
                 stream_type=StreamType.FRAME,
                 rate=self.fps,
             )
-            encoder_stream.consume(self.add_msg)  # type: ignore
+            encoder_stream.consume(
+                    partial(self.on_recognition, device.id))  # type: ignore
             device.streams.color_video.publish()
+
+    def _nndata_to_age_gender(self, rec: dai.NNData):
+        age = int(rec.getLayerFp16("age_conv3")[0] * 100)
+        gen = rec.getLayerFp16("prob")
+        gender = "female" if gen[0] > gen[1] else "male"
+        return age, gender
+
+    def on_recognition(self, device_id: str, frame: dai.ImgFrame):
+        msgs = self.get_msgs()
+        if not msgs:
+            return
+        t = int(time.monotonic())
+        if t - self.last_detection < cast(int, self.config.time_delta):
+            return
+        self.last_detection = t
+        detections = msgs["detection"].detections
+        recognitions = msgs["recognition"]
+        for det, rec in zip(detections, recognitions):
+            age, gender = self._nndata_to_age_gender(rec)
+            data = {
+                "confidence": det.confidence,
+                "xmin": det.xmin,
+                "ymin": det.ymin,
+                "xmax": det.xmax,
+                "ymax": det.ymax,
+                "age": age,
+                "gender": gender,
+            }
+
+            self.send_detection(
+                f"Detection from device {device_id}",
+                frames=[(frame, "jpeg")],
+                data=data,
+                tags=["detection"]
+            )
 
     def on_update(self):
         if IS_INTERACTIVE:
@@ -134,11 +183,7 @@ class AgeGender(App):
 
                     for det, rec in zip(detections, recognitions):
                         bbox = self.make_bbox(det)
-                        age = int(rec.getLayerFp16("age_conv3")[0] * 100)
-                        gender = rec.getLayerFp16("prob")
-                        gender_str = ("female" if gender[0] > gender[1]
-                                      else "male")
-
+                        age, gender = self._nndata_to_age_gender(rec)
                         cv2.rectangle(
                             frame,
                             (bbox[0], bbox[1]),
@@ -167,7 +212,7 @@ class AgeGender(App):
                         )
                         cv2.putText(
                             frame,
-                            gender_str,
+                            gender,
                             (bbox[0], y + 30),
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
@@ -176,7 +221,7 @@ class AgeGender(App):
                         )
                         cv2.putText(
                             frame,
-                            gender_str,
+                            gender,
                             (bbox[0], y + 30),
                             cv2.FONT_HERSHEY_TRIPLEX,
                             1.5,
