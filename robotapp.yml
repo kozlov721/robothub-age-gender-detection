@@ -1,4 +1,4 @@
-version: '1.0.0'
+version: '1.2.0'
 image: luxonis/basic-app
 name: Age and Gender Recognition
 description: Age and gender recognition.
@@ -18,4 +18,4 @@ configuration:
     step: 1
     min: 1
     max: 60
-    default: 10
+    default: 5

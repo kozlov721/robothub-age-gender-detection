@@ -1,9 +1,9 @@
-from typing import cast
+from typing import cast, Optional
 from functools import partial
 from pathlib import Path
 
 from robothub_sdk import App, IS_INTERACTIVE, CameraResolution, StreamType
-from robothub_sdk.device import Device
+from robothub_sdk.device import Device, StereoDepth
 
 import depthai as dai
 import numpy as np
@@ -17,10 +17,9 @@ class AgeGender(App):
     def on_initialize(self, _):
         self.config.add_defaults(
             detection_threshold=0.7,
-            time_delta=10,
+            time_delta=5,
         )
         self.fps = 20
-        self.res = CameraResolution.THE_1080_P
         self.preview_size = (1080, 1080)
         self.msgs = {}
         self.last_detection = int(time.monotonic())
@@ -30,7 +29,12 @@ class AgeGender(App):
         bbox = np.clip(bbox, 0.0, 1.0)
         return (bbox * self.preview_size[0]).astype("int")
 
-    def add_msg(self, msg: dai.ImgFrame | dai.ImgDetections | dai.NNData):
+    def add_msg(self,
+                msg: dai.ImgFrame
+                   | dai.ImgDetections
+                   | dai.SpatialImgDetections
+                   | dai.NNData):
+        # print(f"add_msg: {type(msg)}")
         seq = str(msg.getSequenceNum())
         if seq not in self.msgs:
             self.msgs[seq] = {}
@@ -40,15 +44,12 @@ class AgeGender(App):
         if isinstance(msg, dai.NNData):
             self.msgs[seq]["recognition"].append(msg)
 
-        elif isinstance(msg, dai.ImgDetections):
+        elif isinstance(msg, (dai.SpatialImgDetections, dai.ImgDetections)):
             self.msgs[seq]["detection"] = msg
             self.msgs[seq]["len"] = len(msg.detections)
 
         elif isinstance(msg, dai.ImgFrame):
             self.msgs[seq]["color"] = msg
-
-        if len(self.msgs) > 15:
-            self.msgs.popitem()
 
     def get_msgs(self):
         seq_remove = []
@@ -64,23 +65,41 @@ class AgeGender(App):
     def on_setup(self, device: Device):
         camera = device.configure_camera(
             dai.CameraBoardSocket.RGB,
-            res=self.res,
+            res=CameraResolution.THE_1080_P,
             fps=self.fps,
             preview_size=self.preview_size,
         )
         camera.initialControl.setSceneMode(
                 dai.CameraControl.SceneMode.FACE_PRIORITY)
 
-        self.scale_x = camera.getVideoWidth() // self.preview_size[0]
-        self.scale_y = camera.getVideoHeight() // self.preview_size[1]
+        stereo: Optional[StereoDepth] = None
+        if len(device.cameras) > 1:
+            device.configure_camera(
+                dai.CameraBoardSocket.LEFT,
+                res=CameraResolution.THE_400_P,
+                fps=self.fps,
+            )
+            device.configure_camera(
+                dai.CameraBoardSocket.RIGHT,
+                res=CameraResolution.THE_400_P,
+                fps=self.fps,
+            )
+            stereo = device.create_stereo_depth()
+            stereo.setDefaultProfilePreset(
+                    dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
 
-        _, face_det_nn, face_det_nn_passthrough = device.create_nn(
+        nn, face_det_nn, face_det_nn_passthrough = device.create_nn(
             device.streams.color_preview,
             Path("./face-detection.blob"),
             nn_family="mobilenet",
+            depth=stereo,
             input_size=(300, 300),
             confidence=cast(float, self.config.detection_threshold),
         )
+        if stereo:
+            nn.setBoundingBoxScaleFactor(0.8)
+            nn.setDepthLowerThreshold(100)
+            nn.setDepthUpperThreshold(5000)
 
         rec_manip, rec_manip_stream = device.create_image_manipulator()
         rec_manip.inputConfig.setWaitForMessage(True)
@@ -107,18 +126,21 @@ class AgeGender(App):
         face_det_nn.consume(self.add_msg)  # type: ignore
         rec_nn.consume(self.add_msg)  # type: ignore
         device.streams.color_preview.consume(self.add_msg)  # type: ignore
+        if stereo:
+            device.streams.mono_left_video.consume()
+            device.streams.mono_right_video.consume()
 
         if IS_INTERACTIVE:
             device.streams.color_preview.description = (
                 f"{device.name} {device.streams.color_preview.description}"
             )
         else:
-            res_manip, res_manip_stream = device.create_image_manipulator()
-            res_manip.initialConfig.setResize(1056, self.preview_size[1])
-            res_manip.setMaxOutputFrameSize(1056 * self.preview_size[1] * 3)
-            device.streams.color_video.output_node.link(res_manip.inputImage)
+            enc_manip, enc_manip_stream = device.create_image_manipulator()
+            enc_manip.initialConfig.setResize(1056, self.preview_size[1])
+            enc_manip.setMaxOutputFrameSize(1056 * self.preview_size[1] * 3)
+            device.streams.color_video.output_node.link(enc_manip.inputImage)
             encoder = device.create_encoder(
-                res_manip_stream.output_node,
+                enc_manip_stream.output_node,
                 fps=self.fps,
                 profile=dai.VideoEncoderProperties.Profile.MJPEG,
                 quality=80,
@@ -131,7 +153,7 @@ class AgeGender(App):
             )
             encoder_stream.consume(
                     partial(self.on_recognition, device.id))  # type: ignore
-            device.streams.color_video.publish()
+            enc_manip_stream.publish()
 
     def _nndata_to_age_gender(self, rec: dai.NNData):
         age = int(rec.getLayerFp16("age_conv3")[0] * 100)
@@ -143,15 +165,12 @@ class AgeGender(App):
         msgs = self.get_msgs()
         if not msgs:
             return
-        t = int(time.monotonic())
-        if t - self.last_detection < cast(int, self.config.time_delta):
-            return
-        self.last_detection = t
         detections = msgs["detection"].detections
         recognitions = msgs["recognition"]
+        data = []
         for det, rec in zip(detections, recognitions):
             age, gender = self._nndata_to_age_gender(rec)
-            data = {
+            dict = {
                 "confidence": det.confidence,
                 "xmin": det.xmin,
                 "ymin": det.ymin,
@@ -160,6 +179,14 @@ class AgeGender(App):
                 "age": age,
                 "gender": gender,
             }
+            if isinstance(det, dai.SpatialImgDetection):
+                dict["z"] = det.spatialCoordinates.z / 1000
+            data.append(dict)
+
+        t = int(time.monotonic())
+        delta = cast(int, self.config.time_delta)
+        if data and t - self.last_detection >= delta:
+            self.last_detection = t
 
             self.send_detection(
                 f"Detection from device {device_id}",
@@ -228,6 +255,27 @@ class AgeGender(App):
                             (255, 255, 255),
                             2,
                         )
+                        if isinstance(det, dai.SpatialImgDetection):
+                            z = det.spatialCoordinates.z / 1000
+                            coords = f"Z: {z:.2f} m"
+                            cv2.putText(
+                                frame,
+                                coords,
+                                (bbox[0], y + 60),
+                                cv2.FONT_HERSHEY_TRIPLEX,
+                                1,
+                                (0, 0, 0),
+                                8
+                            )
+                            cv2.putText(
+                                frame,
+                                coords,
+                                (bbox[0], y + 60),
+                                cv2.FONT_HERSHEY_TRIPLEX,
+                                1,
+                                (255, 255, 255),
+                                2
+                            )
                     cv2.imshow(
                         device.streams.color_preview.description,
                         frame,
